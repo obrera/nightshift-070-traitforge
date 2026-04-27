@@ -12,6 +12,10 @@ export default defineConfig({
       "@obrera/mpl-core-kit-lib": path.resolve(
         rootDir,
         "packages/mpl-core-kit-lib/dist/index.mjs"
+      ),
+      "@solana/kit": path.resolve(
+        rootDir,
+        "node_modules/@solana/kit/dist/index.browser.mjs"
       )
     }
   },
