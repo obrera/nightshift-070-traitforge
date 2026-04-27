@@ -1,0 +1,7 @@
+# nightshift-070-traitforge
+.codex
+node_modules/
+dist/
+.DS_Store
+data/traitforge-db.json
+npm-debug.log*
