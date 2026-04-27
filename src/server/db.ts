@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppState } from "../shared/contracts.js";
 import { createSeedState } from "./seed.js";
+import { normalizeState } from "./state.js";
 
 export class FileDatabase {
   private state: AppState | null = null;
@@ -41,7 +42,14 @@ export class FileDatabase {
 
     try {
       const raw = await readFile(this.filePath, "utf8");
-      this.state = JSON.parse(raw) as AppState;
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      this.state = normalizeState(parsed);
+      if (
+        parsed.version !== 2 ||
+        "mintIntents" in parsed
+      ) {
+        await this.persist();
+      }
     } catch (error) {
       this.state = createSeedState();
       await this.persist();

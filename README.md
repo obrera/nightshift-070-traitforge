@@ -1,23 +1,26 @@
 # TraitForge
 
-TraitForge is a wizard-first MPL Core collectible composer for Nightshift build 070. It lets creators assemble a server-defined collectible schema, preview the layered result, validate conflicts and rarity pressure, save shareable drafts, and create simulated devnet-ready mint intents with server-side persistence.
+TraitForge is a wizard-first MPL Core collectible composer for Nightshift build 070. Creators compose traits from a server-authored schema, preview the layered SVG, save drafts, and submit real Solana devnet MPL Core mints through a server custodial signer.
 
 ## Features
 
-- wizard-first trait composition flow with layered SVG preview rendering
-- conflict detection, rarity scoring, percentile meter, and mint quote breakdowns
-- saved draft links with persisted creator history and reusable compositions
-- operator schema lab with editable trait caps, rarity distribution analytics, and metadata diff review
-- durable server-side JSON persistence plus visible Obrera operator activity in the app timeline
+- wizard-driven trait composition with live layered SVG rendering
+- server-side conflict checks, rarity scoring, percentile reporting, and quote breakdowns
+- saved draft links with persisted preview assets
+- real devnet MPL Core minting to a user-supplied recipient wallet address
+- lazy on-chain collection creation per TraitForge collection schema, then reuse on later mints
+- public metadata JSON and SVG preview routes for both collections and minted assets
+- persisted mint history with asset address, signature, recipient owner, collection address, and explorer links
+- operator schema lab with editable caps, analytics, and metadata diff inspection
 
 ## Stack
 
 - TypeScript
 - React + Vite
 - Express
-- local `@obrera/mpl-core-kit-lib` package dependency
-- durable JSON-backed server persistence (`data/traitforge-db.json`)
-- Dockerfile + `docker-compose.yml` for single-container deployment
+- `@solana/kit`
+- local `@obrera/mpl-core-kit-lib` from `../mpl-core-kit-lib`
+- durable JSON-backed persistence in `data/traitforge-db.json`
 
 ## Seeded accounts
 
@@ -25,13 +28,38 @@ TraitForge is a wizard-first MPL Core collectible composer for Nightshift build 
 - `pilot` / `pilotpass!` — creator
 - `marina` / `relaypass!` — creator
 
-## Required API routes
+## Devnet minting config
 
-- `GET /api/collections/:slug/schema`
-- `POST /api/drafts/render`
-- `POST /api/mints/quote`
-- `POST /api/mints/create`
-- `GET /api/assets/:id`
+Real minting requires these environment variables:
+
+```bash
+export TRAITFORGE_PUBLIC_BASE_URL="https://your-app.example.com"
+export TRAITFORGE_DEVNET_SIGNER_KEYPAIR="/absolute/path/to/devnet-keypair.json"
+```
+
+`TRAITFORGE_PUBLIC_BASE_URL` must be the stable public origin that will serve:
+
+- `/api/collections/:slug/metadata.json`
+- `/api/collections/:slug/preview.svg`
+- `/api/assets/:id/metadata.json`
+- `/api/assets/:id/preview.svg`
+
+`TRAITFORGE_DEVNET_SIGNER_KEYPAIR` may be:
+
+- a path to a Solana keypair JSON file such as `~/.config/solana/id.json`
+- a raw 64-byte JSON array
+- a comma-separated 64-byte list
+- a `base64:<value>` string
+
+Optional overrides:
+
+```bash
+export TRAITFORGE_DEVNET_RPC_URL="https://api.devnet.solana.com"
+export TRAITFORGE_DEVNET_WS_URL="wss://api.devnet.solana.com"
+export TRAITFORGE_DATA_PATH="/custom/path/traitforge-db.json"
+```
+
+If the signer is underfunded, the mint route fails with a balance error that includes the current SOL balance and the rough amount needed. When the app is running locally against devnet, the server also attempts a lightweight devnet airdrop before failing.
 
 ## Run locally
 
@@ -42,22 +70,33 @@ npm run build
 npm start
 ```
 
-The app serves the built frontend and API from `http://localhost:3001` by default.
+Default server URL:
 
-## Live status
+- `http://localhost:3001`
 
-- Live URL: https://traitforge070.colmena.dev
-- Repo URL: https://github.com/obrera/nightshift-070-traitforge
+For local real minting, set:
 
-## Challenge metadata
+```bash
+export TRAITFORGE_PUBLIC_BASE_URL="http://localhost:3001"
+export TRAITFORGE_DEVNET_SIGNER_KEYPAIR="$HOME/.config/solana/devnet.json"
+```
 
-- Challenge: `2026-04-27 — Nightshift build 070`
-- Agent: Obrera
-- Model: `openai-codex/gpt-5.4`
-- Reasoning: `off`
+## API surface
+
+- `GET /api/bootstrap`
+- `GET /api/collections/:slug/schema`
+- `GET /api/collections/:slug/metadata.json`
+- `GET /api/collections/:slug/preview.svg`
+- `POST /api/drafts/render`
+- `POST /api/drafts`
+- `POST /api/mints/quote`
+- `POST /api/mints/create`
+- `GET /api/assets/:id`
+- `GET /api/assets/:id/metadata.json`
+- `GET /api/assets/:id/preview.svg`
 
 ## Notes
 
-- The mint flow is a simulated devnet-ready workflow. It uses the local MPL Core helper package to shape metadata, pricing, and pseudo mint addresses without asking users to sign live transactions.
-- Trait caps and conflicts are enforced server-side so saved drafts and mint intents stay consistent.
-- The product intentionally uses a wizard/editor shell instead of a generic status dashboard.
+- The client login UX is still seeded/local; only the mint execution moved on-chain.
+- The server never uses `@solana/web3.js`; minting is built with `@solana/kit` plus the local `@obrera/mpl-core-kit-lib`.
+- Existing legacy simulated mint records are migrated away on load so the app state only keeps real mint records going forward.

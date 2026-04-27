@@ -1,4 +1,5 @@
-import { buildMplCoreMetadata, createSimulatedMintAddress } from "@obrera/mpl-core-kit-lib";
+import { fetchAssetV1, fetchMaybeCollectionV1 } from "@obrera/mpl-core-kit-lib";
+import { address, assertIsAddress, createSolanaRpc, devnet } from "@solana/kit";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -9,11 +10,13 @@ import type {
   AssetRecord,
   AuthRequest,
   CollectionSchema,
-  CreateMintRequest,
+  ConfirmMintRequest,
   DraftRecord,
+  PrepareMintRequest,
   SaveDraftRequest,
   UserRecord
 } from "../shared/contracts.js";
+import { buildMplCoreMetadata } from "../shared/mpl.js";
 import { FileDatabase } from "./db.js";
 import {
   buildAnalytics,
@@ -24,6 +27,12 @@ import {
   listCollections,
   quoteDraft
 } from "./logic.js";
+import {
+  buildAssetArtifacts,
+  buildCollectionMetadataDocument,
+  getCollectionPublicUrls,
+  normalizePublicBaseUrl
+} from "./minting/metadata.js";
 import {
   clearCookieHeader,
   createId,
@@ -40,14 +49,24 @@ const rootDir = path.resolve(__dirname, "..", "..");
 const publicDir = path.resolve(rootDir, "dist", "public");
 const cookieName = "tf_session";
 const sessionMaxAgeSeconds = 60 * 60 * 24 * 14;
+const defaultDevnetRpcUrl = "https://api.devnet.solana.com";
 const dataPath =
   process.env.TRAITFORGE_DATA_PATH ??
   path.resolve(rootDir, "data", "traitforge-db.json");
 
 const db = new FileDatabase(dataPath);
 const app = express();
+const collectionMintLocks = new Map<string, Promise<void>>();
 
 app.use(express.json({ limit: "2mb" }));
+
+function getDevnetRpcUrl(): string {
+  return process.env.TRAITFORGE_DEVNET_RPC_URL?.trim() || defaultDevnetRpcUrl;
+}
+
+function createDevnetExplorerUrl(kind: "address" | "tx", value: string): string {
+  return `https://explorer.solana.com/${kind}/${value}?cluster=devnet`;
+}
 
 function getSessionUser(state: AppState, request: Request): UserRecord | null {
   const sessionId = parseCookies(request)[cookieName];
@@ -161,15 +180,46 @@ function draftsForUser(state: AppState, user: UserRecord | null): DraftRecord[] 
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
-function mintIntentsForUser(state: AppState, user: UserRecord | null) {
-  const intents =
+function mintsForUser(state: AppState, user: UserRecord | null) {
+  const mints =
     user?.role === "operator"
-      ? state.mintIntents
-      : state.mintIntents.filter((entry) => entry.userId === user?.id);
+      ? state.mints
+      : state.mints.filter((entry) => entry.userId === user?.id);
 
-  return [...intents].sort((left, right) =>
+  return [...mints].sort((left, right) =>
     right.createdAt.localeCompare(left.createdAt)
   );
+}
+
+function getRequestBaseUrl(request: Request): string {
+  const configured = process.env.TRAITFORGE_PUBLIC_BASE_URL?.trim();
+  if (configured) {
+    return normalizePublicBaseUrl(configured);
+  }
+
+  return `${request.protocol}://${request.get("host") ?? "localhost:3001"}`;
+}
+
+async function withCollectionMintLock<T>(
+  collectionSlug: string,
+  run: () => Promise<T>
+): Promise<T> {
+  const previous = collectionMintLocks.get(collectionSlug) ?? Promise.resolve();
+  let release: (() => void) | undefined;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  collectionMintLocks.set(collectionSlug, previous.then(() => current));
+
+  await previous;
+  try {
+    return await run();
+  } finally {
+    release?.();
+    if (collectionMintLocks.get(collectionSlug) === current) {
+      collectionMintLocks.delete(collectionSlug);
+    }
+  }
 }
 
 app.get(
@@ -311,7 +361,7 @@ app.get(
       },
       collections: listCollections(state),
       drafts: draftsForUser(state, user),
-      mintIntents: mintIntentsForUser(state, user).slice(0, 8),
+      mints: mintsForUser(state, user).slice(0, 8),
       activity: [...state.activity]
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
         .slice(0, 16)
@@ -328,6 +378,32 @@ app.get(
       collection,
       usage: computeUsageStats(state, collection)
     });
+  })
+);
+
+app.get(
+  "/api/collections/:slug/metadata.json",
+  asyncRoute(async (request, response) => {
+    const state = await db.read();
+    const collection = getCollectionBySlug(state, getParam(request.params.slug));
+    response.json(
+      buildCollectionMetadataDocument(collection, getRequestBaseUrl(request))
+    );
+  })
+);
+
+app.get(
+  "/api/collections/:slug/preview.svg",
+  asyncRoute(async (request, response) => {
+    const state = await db.read();
+    const collection = getCollectionBySlug(state, getParam(request.params.slug));
+    const preview = composeDraft(
+      state,
+      collection.slug,
+      collection.defaultTraitSelection,
+      collection.name
+    );
+    response.type("image/svg+xml").send(preview.preview.svg);
   })
 );
 
@@ -411,7 +487,7 @@ app.post(
         previewAssetId = createId("asset");
         state.assets.push({
           id: previewAssetId,
-          ownerUserId: auth.user.id,
+          requesterUserId: auth.user.id,
           collectionSlug: payload.collectionSlug,
           previewSvg: composition.preview.svg,
           metadata: buildMplCoreMetadata(composition.preview.metadataInput),
@@ -497,75 +573,297 @@ app.post(
 );
 
 app.post(
-  "/api/mints/create",
+  "/api/mints/prepare",
   asyncRoute(async (request, response) => {
     const auth = await requireUser(request, response);
     if (!auth) {
       return;
     }
 
-    const payload = request.body as CreateMintRequest;
-    const created = await db.update((state) => {
+    const payload = request.body as PrepareMintRequest;
+    const recipientOwnerAddress = payload.recipientOwnerAddress?.trim() ?? "";
+    if (!recipientOwnerAddress) {
+      throw new Error("A connected wallet is required before minting on devnet.");
+    }
+    try {
+      assertIsAddress(recipientOwnerAddress);
+    } catch {
+      throw new Error("Connected wallet address must be a valid Solana address.");
+    }
+
+    const publicBaseUrl = getRequestBaseUrl(request);
+    const collectionUrls = getCollectionPublicUrls(
+      publicBaseUrl,
+      payload.collectionSlug
+    );
+
+    const prepared = await db.update((state) => {
       const collection = getCollectionBySlug(state, payload.collectionSlug);
+      const mintName = payload.name?.trim() || `${collection.name} Mint`;
       const quoted = quoteDraft(
         state,
         payload.collectionSlug,
         payload.selections,
-        payload.name ?? `${collection.name} Mint`
+        mintName
       );
 
       if (quoted.conflicts.length > 0) {
-        throw new Error("Resolve conflicts before mint creation.");
+        throw new Error("Resolve conflicts before minting on devnet.");
       }
 
-      const now = nowUtc();
       const assetId = createId("asset");
-      const mintId = createId("mint");
+      const artifacts = buildAssetArtifacts({
+        assetId,
+        collection,
+        name: mintName,
+        publicBaseUrl,
+        selections: quoted.selections
+      });
       const asset: AssetRecord = {
         id: assetId,
-        ownerUserId: auth.user.id,
+        requesterUserId: auth.user.id,
         collectionSlug: payload.collectionSlug,
-        previewSvg: quoted.preview.svg,
-        metadata: buildMplCoreMetadata(quoted.preview.metadataInput),
-        createdAt: now,
-        sourceDraftId: payload.draftId,
-        mintIntentId: mintId
-      };
-      const mintIntent = {
-        id: mintId,
-        userId: auth.user.id,
-        collectionSlug: payload.collectionSlug,
-        draftId: payload.draftId,
-        assetId,
-        quote: quoted.quote,
-        simulatedAddress: createSimulatedMintAddress(
-          `${payload.collectionSlug}:${auth.user.id}:${now}`
-        ),
-        status: "minted" as const,
-        createdAt: now
+        previewSvg: artifacts.previewSvg,
+        metadata: artifacts.metadata,
+        createdAt: nowUtc(),
+        recipientOwnerAddress,
+        metadataUrl: artifacts.metadataUrl,
+        imageUrl: artifacts.imageUrl,
+        sourceDraftId: payload.draftId
       };
 
       state.assets.unshift(asset);
-      state.mintIntents.unshift(mintIntent);
 
-      if (payload.draftId) {
-        const draft = state.drafts.find((entry) => entry.id === payload.draftId);
-        if (draft && (draft.userId === auth.user.id || auth.user.role === "operator")) {
-          draft.lastQuote = quoted.quote;
-          draft.updatedAt = now;
-        }
+      return {
+        asset,
+        collection,
+        mintName,
+        quoted
+      };
+    });
+
+    response.status(201).json({
+      ...prepared.quoted,
+      plan: {
+        assetId: prepared.asset.id,
+        assetImageUrl: prepared.asset.imageUrl ?? "",
+        assetMetadataUrl: prepared.asset.metadataUrl ?? "",
+        collection: prepared.collection.devnetCollection
+          ? {
+              mode: "existing" as const,
+              address: prepared.collection.devnetCollection.address,
+              metadataUrl: prepared.collection.devnetCollection.metadataUrl,
+              imageUrl: prepared.collection.devnetCollection.imageUrl
+            }
+          : {
+              mode: "new" as const,
+              metadataUrl: collectionUrls.metadataUrl,
+              imageUrl: collectionUrls.imageUrl
+            },
+        mintName: prepared.mintName
       }
+    });
+  })
+);
 
-      state.activity.unshift(
-        makeActivity(
-          auth.user,
-          "mint",
-          "Mint Simulator",
-          `Created mint intent ${mintIntent.simulatedAddress}.`
-        )
+app.post(
+  "/api/mints/confirm",
+  asyncRoute(async (request, response) => {
+    const auth = await requireUser(request, response);
+    if (!auth) {
+      return;
+    }
+
+    const payload = request.body as ConfirmMintRequest;
+    const recipientOwnerAddress = payload.recipientOwnerAddress?.trim() ?? "";
+    const assetAddressText = payload.assetAddress?.trim() ?? "";
+    const collectionAddressText = payload.collectionAddress?.trim() ?? "";
+    const signature = payload.signature?.trim() ?? "";
+
+    if (!recipientOwnerAddress) {
+      throw new Error("A connected wallet is required before minting on devnet.");
+    }
+    if (!signature) {
+      throw new Error("Mint confirmation is missing the submitted transaction signature.");
+    }
+
+    try {
+      assertIsAddress(recipientOwnerAddress);
+      assertIsAddress(assetAddressText);
+      assertIsAddress(collectionAddressText);
+    } catch {
+      throw new Error("Confirmed mint payload contains an invalid Solana address.");
+    }
+
+    const publicBaseUrl = getRequestBaseUrl(request);
+    const collectionUrls = getCollectionPublicUrls(
+      publicBaseUrl,
+      payload.collectionSlug
+    );
+    const rpc = createSolanaRpc(devnet(getDevnetRpcUrl()));
+
+    const created = await withCollectionMintLock(payload.collectionSlug, async () => {
+      const state = await db.read();
+      const collection = getCollectionBySlug(state, payload.collectionSlug);
+      const mintName = payload.name?.trim() || `${collection.name} Mint`;
+      const quoted = quoteDraft(
+        state,
+        payload.collectionSlug,
+        payload.selections,
+        mintName
       );
 
-      return { asset, mintIntent };
+      if (quoted.conflicts.length > 0) {
+        throw new Error("Resolve conflicts before minting on devnet.");
+      }
+
+      const preparedAsset = state.assets.find((entry) => entry.id === payload.assetId);
+      if (!preparedAsset) {
+        throw new Error("Prepared mint artifact not found. Start the mint flow again.");
+      }
+      if (preparedAsset.mintId) {
+        throw new Error("Prepared mint artifact has already been confirmed.");
+      }
+      if (
+        preparedAsset.requesterUserId !== auth.user.id &&
+        auth.user.role !== "operator"
+      ) {
+        throw new Error("You can only confirm your own prepared mints.");
+      }
+      if (preparedAsset.collectionSlug !== payload.collectionSlug) {
+        throw new Error("Prepared mint artifact does not match this collection.");
+      }
+      if (!preparedAsset.metadataUrl || !preparedAsset.imageUrl) {
+        throw new Error("Prepared mint artifact is missing server-hosted metadata.");
+      }
+
+      const confirmedAsset = await fetchAssetV1(rpc, address(assetAddressText));
+      if (confirmedAsset.data.owner !== recipientOwnerAddress) {
+        throw new Error("Confirmed asset owner does not match the connected wallet.");
+      }
+      if (confirmedAsset.data.name !== mintName) {
+        throw new Error("Confirmed asset name does not match the prepared mint.");
+      }
+      if (confirmedAsset.data.uri !== preparedAsset.metadataUrl) {
+        throw new Error("Confirmed asset metadata URI does not match the prepared mint.");
+      }
+      if (
+        confirmedAsset.data.updateAuthority.__kind !== "Collection" ||
+        confirmedAsset.data.updateAuthority.fields[0] !== collectionAddressText
+      ) {
+        throw new Error("Confirmed asset is not attached to the expected collection.");
+      }
+
+      const confirmedCollection = await fetchMaybeCollectionV1(
+        rpc,
+        address(collectionAddressText)
+      );
+      if (!confirmedCollection.exists) {
+        throw new Error("Confirmed collection account was not found on devnet.");
+      }
+
+      const expectedCollectionMetadataUrl =
+        collection.devnetCollection?.address === collectionAddressText
+          ? collection.devnetCollection.metadataUrl
+          : collectionUrls.metadataUrl;
+      if (confirmedCollection.data.uri !== expectedCollectionMetadataUrl) {
+        throw new Error(
+          "Confirmed collection metadata URI does not match the expected TraitForge collection metadata."
+        );
+      }
+
+      return db.update((current) => {
+        const now = nowUtc();
+        const currentCollection = current.collections.find(
+          (entry) => entry.slug === payload.collectionSlug
+        );
+        if (!currentCollection) {
+          throw new Error("Collection not found.");
+        }
+
+        const asset = current.assets.find((entry) => entry.id === payload.assetId);
+        if (!asset) {
+          throw new Error("Prepared mint artifact disappeared before confirmation.");
+        }
+        if (asset.mintId) {
+          throw new Error("Prepared mint artifact has already been confirmed.");
+        }
+        if (!asset.metadataUrl || !asset.imageUrl) {
+          throw new Error("Prepared mint artifact is missing server-hosted metadata.");
+        }
+
+        let createdCollection = false;
+        if (!currentCollection.devnetCollection) {
+          currentCollection.devnetCollection = {
+            address: collectionAddressText,
+            explorerUrl: createDevnetExplorerUrl("address", collectionAddressText),
+            metadataUrl: collectionUrls.metadataUrl,
+            imageUrl: collectionUrls.imageUrl,
+            createdAt: now
+          };
+          createdCollection = true;
+        }
+
+        const mintId = createId("mint");
+        asset.recipientOwnerAddress = confirmedAsset.data.owner;
+        asset.onChainAddress = confirmedAsset.address;
+        asset.mintId = mintId;
+
+        const mint = {
+          id: mintId,
+          userId: auth.user.id,
+          collectionSlug: payload.collectionSlug,
+          draftId: payload.draftId,
+          assetId: asset.id,
+          quote: quoted.quote,
+          cluster: "devnet" as const,
+          assetAddress: confirmedAsset.address,
+          signature,
+          recipientOwnerAddress: confirmedAsset.data.owner,
+          collectionAddress: collectionAddressText,
+          metadataUrl: asset.metadataUrl,
+          imageUrl: asset.imageUrl,
+          explorerUrls: {
+            asset: createDevnetExplorerUrl("address", confirmedAsset.address),
+            transaction: createDevnetExplorerUrl("tx", signature),
+            collection: createDevnetExplorerUrl("address", collectionAddressText)
+          },
+          status: "minted" as const,
+          createdAt: now
+        };
+
+        current.mints.unshift(mint);
+
+        if (payload.draftId) {
+          const draft = current.drafts.find((entry) => entry.id === payload.draftId);
+          if (draft && (draft.userId === auth.user.id || auth.user.role === "operator")) {
+            draft.lastQuote = quoted.quote;
+            draft.updatedAt = now;
+          }
+        }
+
+        if (createdCollection) {
+          current.activity.unshift(
+            makeActivity(
+              auth.user,
+              "mint",
+              "Devnet Collection",
+              `Created devnet MPL Core collection ${collectionAddressText}.`
+            )
+          );
+        }
+
+        current.activity.unshift(
+          makeActivity(
+            auth.user,
+            "mint",
+            "Devnet Mint",
+            `Minted ${confirmedAsset.address} to ${confirmedAsset.data.owner} on devnet.`
+          )
+        );
+
+        return { asset, mint };
+      });
     });
 
     response.status(201).json(created);
@@ -587,6 +885,34 @@ app.get(
 );
 
 app.get(
+  "/api/assets/:id/metadata.json",
+  asyncRoute(async (request, response) => {
+    const state = await db.read();
+    const asset = state.assets.find((entry) => entry.id === request.params.id);
+    if (!asset) {
+      response.status(404).json({ error: "Asset not found." });
+      return;
+    }
+
+    response.json(asset.metadata);
+  })
+);
+
+app.get(
+  "/api/assets/:id/preview.svg",
+  asyncRoute(async (request, response) => {
+    const state = await db.read();
+    const asset = state.assets.find((entry) => entry.id === request.params.id);
+    if (!asset) {
+      response.status(404).json({ error: "Asset not found." });
+      return;
+    }
+
+    response.type("image/svg+xml").send(asset.previewSvg);
+  })
+);
+
+app.get(
   "/api/admin/collections/:slug/analytics",
   asyncRoute(async (request, response) => {
     const auth = await requireOperator(request, response);
@@ -597,7 +923,7 @@ app.get(
     const analytics = buildAnalytics(auth.state, getParam(request.params.slug));
     response.json({
       ...analytics,
-      recentMintIntents: auth.state.mintIntents
+      recentMints: auth.state.mints
         .filter((entry) => entry.collectionSlug === getParam(request.params.slug))
         .slice(0, 8)
     });

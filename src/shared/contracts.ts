@@ -2,7 +2,7 @@ import type {
   MintQuote,
   MplCoreMetadata,
   MplCoreMetadataInput
-} from "@obrera/mpl-core-kit-lib";
+} from "./mpl.js";
 
 export type UserRole = "operator" | "creator";
 
@@ -71,6 +71,13 @@ export interface CollectionSchema {
   collectionKey: string;
   targetSupply: number;
   mintedCount: number;
+  devnetCollection?: {
+    address: string;
+    explorerUrl: string;
+    metadataUrl: string;
+    imageUrl: string;
+    createdAt: string;
+  };
   defaultTraitSelection: TraitSelection;
   slots: TraitSlotDefinition[];
 }
@@ -138,24 +145,39 @@ export interface DraftRecord {
 
 export interface AssetRecord {
   id: string;
-  ownerUserId: string;
+  requesterUserId: string;
   collectionSlug: string;
   previewSvg: string;
   metadata: MplCoreMetadata;
   createdAt: string;
+  recipientOwnerAddress?: string;
+  onChainAddress?: string;
+  metadataUrl?: string;
+  imageUrl?: string;
   sourceDraftId?: string;
-  mintIntentId?: string;
+  mintId?: string;
 }
 
-export interface MintIntentRecord {
+export interface MintRecord {
   id: string;
   userId: string;
   collectionSlug: string;
   draftId?: string;
   assetId: string;
   quote: MintQuote;
-  simulatedAddress: string;
-  status: "quoted" | "minted";
+  cluster: "devnet";
+  assetAddress: string;
+  signature: string;
+  recipientOwnerAddress: string;
+  collectionAddress: string;
+  metadataUrl: string;
+  imageUrl: string;
+  explorerUrls: {
+    asset: string;
+    transaction: string;
+    collection: string;
+  };
+  status: "minted";
   createdAt: string;
 }
 
@@ -170,13 +192,13 @@ export interface ActivityRecord {
 }
 
 export interface AppState {
-  version: number;
+  version: 2;
   users: UserRecord[];
   sessions: SessionRecord[];
   collections: CollectionSchema[];
   drafts: DraftRecord[];
   assets: AssetRecord[];
-  mintIntents: MintIntentRecord[];
+  mints: MintRecord[];
   activity: ActivityRecord[];
 }
 
@@ -210,12 +232,43 @@ export interface MintQuoteResponse extends RenderDraftResponse {
   warnings: string[];
 }
 
-export interface CreateMintRequest extends RenderDraftRequest {
+export interface CreateMintPlan {
+  assetId: string;
+  assetMetadataUrl: string;
+  assetImageUrl: string;
+  collection:
+    | {
+        mode: "existing";
+        address: string;
+        metadataUrl: string;
+        imageUrl: string;
+      }
+    | {
+        mode: "new";
+        metadataUrl: string;
+        imageUrl: string;
+      };
+  mintName: string;
+}
+
+export interface PrepareMintRequest extends RenderDraftRequest {
   draftId?: string;
+  recipientOwnerAddress: string;
+}
+
+export interface PrepareMintResponse extends MintQuoteResponse {
+  plan: CreateMintPlan;
+}
+
+export interface ConfirmMintRequest extends PrepareMintRequest {
+  assetId: string;
+  assetAddress: string;
+  collectionAddress: string;
+  signature: string;
 }
 
 export interface CreateMintResponse {
-  mintIntent: MintIntentRecord;
+  mint: MintRecord;
   asset: AssetRecord;
 }
 
@@ -257,14 +310,14 @@ export interface AdminSchemaUpdateRequest {
 export interface AnalyticsResponse {
   rarityBuckets: RarityBucket[];
   usage: TraitUsageStat[];
-  recentMintIntents: MintIntentRecord[];
+  recentMints: MintRecord[];
 }
 
 export interface DashboardResponse {
   session: AuthSession;
   collections: CollectionSchema[];
   drafts: DraftRecord[];
-  mintIntents: MintIntentRecord[];
+  mints: MintRecord[];
   activity: ActivityRecord[];
 }
 

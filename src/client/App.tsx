@@ -1,4 +1,10 @@
-import { lamportsToSol } from "@obrera/mpl-core-kit-lib";
+import {
+  type UiWallet,
+  type UiWalletAccount,
+  useWalletUi,
+  useWalletUiSigner,
+  useWalletUiWallet
+} from "@wallet-ui/react";
 import {
   startTransition,
   useDeferredValue,
@@ -11,16 +17,22 @@ import type {
   AnalyticsResponse,
   CollectionSchema,
   CollectionSchemaResponse,
+  ConfirmMintRequest,
+  CreateMintResponse,
   DashboardResponse,
   DraftRecord,
   DraftViewResponse,
   MetadataDiffResponse,
   MintQuoteResponse,
+  PrepareMintRequest,
+  PrepareMintResponse,
   RenderDraftResponse,
   SaveDraftResponse,
   TraitSelection,
   UserSummary
 } from "../shared/contracts";
+import { executeWalletMint } from "./execute-wallet-mint";
+import { lamportsToSol } from "../shared/mpl";
 
 type AppView = "forge" | "library" | "admin";
 type AuthMode = "login" | "register";
@@ -69,6 +81,58 @@ function draftShareFromPath(pathname: string): string | null {
   return match?.[1] ?? null;
 }
 
+function shortAddress(value: string): string {
+  return value.length <= 12 ? value : `${value.slice(0, 4)}...${value.slice(-4)}`;
+}
+
+type WalletSigner = ReturnType<typeof useWalletUiSigner>;
+
+function WalletConnectOption({
+  disabled,
+  wallet
+}: {
+  disabled: boolean;
+  wallet: UiWallet;
+}) {
+  const { connect, isConnecting } = useWalletUiWallet({ wallet });
+
+  return (
+    <button
+      className="ghost-button wallet-option"
+      disabled={disabled || isConnecting}
+      onClick={() => void connect()}
+      type="button"
+    >
+      {isConnecting ? `Connecting ${wallet.name}...` : `Connect ${wallet.name}`}
+    </button>
+  );
+}
+
+function MintActionButton({
+  account,
+  disabled,
+  isBusy,
+  onMint
+}: {
+  account: UiWalletAccount;
+  disabled: boolean;
+  isBusy: boolean;
+  onMint: (args: { account: UiWalletAccount; walletSigner: WalletSigner }) => Promise<void>;
+}) {
+  const walletSigner = useWalletUiSigner({ account });
+
+  return (
+    <button
+      className="ghost-button action-cta"
+      disabled={disabled}
+      onClick={() => void onMint({ account, walletSigner })}
+      type="button"
+    >
+      {isBusy ? "Minting..." : "Mint From Connected Wallet"}
+    </button>
+  );
+}
+
 export function App() {
   const [path, setPath] = useState(window.location.pathname);
   const [view, setView] = useState<AppView>(initialViewFromPath(window.location.pathname));
@@ -97,7 +161,9 @@ export function App() {
   const [compareDraftId, setCompareDraftId] = useState("");
   const initKeyRef = useRef("");
 
+  const { account, cluster, disconnect, wallet, wallets } = useWalletUi();
   const deferredSelections = useDeferredValue(selections);
+  const connectedWalletAddress = account?.address ?? "";
   const currentUser = bootstrap?.session.user ?? null;
   const isOperator = currentUser?.role === "operator";
   const drafts = bootstrap?.drafts ?? [];
@@ -341,27 +407,61 @@ export function App() {
     }
   }
 
-  async function createMint() {
+  async function createMint({
+    account,
+    walletSigner
+  }: {
+    account: UiWalletAccount;
+    walletSigner: WalletSigner;
+  }) {
     if (!schema?.collection) {
       return;
     }
 
+    const mintSelections = { ...selections };
+    const mintName = draftTitle;
+    const preparePayload: PrepareMintRequest = {
+      draftId: activeDraftId,
+      collectionSlug: schema.collection.slug,
+      selections: mintSelections,
+      name: mintName,
+      recipientOwnerAddress: account.address
+    };
+
     setBusyKey("mint");
     setError(null);
     try {
-      const next = await api<{ mintIntent: { simulatedAddress: string } }>("/api/mints/create", {
+      const prepared = await api<PrepareMintResponse>("/api/mints/prepare", {
+        method: "POST",
+        body: JSON.stringify(preparePayload)
+      });
+      setQuoted(prepared);
+
+      const submitted = await executeWalletMint({
+        collectionName: schema.collection.name,
+        mintPlan: prepared.plan,
+        rpcUrl: cluster.url,
+        walletSigner
+      });
+
+      const next = await api<CreateMintResponse>("/api/mints/confirm", {
         method: "POST",
         body: JSON.stringify({
-          draftId: activeDraftId,
-          collectionSlug: schema.collection.slug,
-          selections,
-          name: draftTitle
-        })
+          ...preparePayload,
+          assetAddress: submitted.assetAddress,
+          assetId: prepared.plan.assetId,
+          collectionAddress: submitted.collectionAddress,
+          signature: submitted.signature
+        } satisfies ConfirmMintRequest)
       });
       await refreshBootstrap();
-      setNotice(`Mint intent created: ${next.mintIntent.simulatedAddress}`);
+      setNotice(
+        `Devnet mint confirmed: ${shortAddress(next.mint.assetAddress)} → ${shortAddress(
+          next.mint.recipientOwnerAddress
+        )}`
+      );
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Mint creation failed.");
+      setError(reason instanceof Error ? reason.message : "Devnet mint failed.");
     } finally {
       setBusyKey(null);
     }
@@ -450,7 +550,7 @@ export function App() {
           <h1>TraitForge</h1>
           <p className="subtitle">
             Wizard-first MPL Core collectible builder with server-authored caps,
-            conflicts, rarity pressure, and simulated mint records.
+            conflicts, rarity pressure, and wallet-signed devnet MPL Core mints.
           </p>
         </div>
         <div className="topbar-actions">
@@ -505,9 +605,56 @@ export function App() {
               <span>03</span>
               <div>
                 <strong>Review & Mint</strong>
-                <small>Quote, save a draft link, or create a mint intent.</small>
+                <small>Quote, save a draft link, or mint from a connected devnet wallet.</small>
               </div>
             </button>
+          </section>
+
+          <section className="panel wallet-panel">
+            <p className="eyebrow">Wallet</p>
+            {account ? (
+              <>
+                <h3>{wallet?.name ?? "Connected Wallet"}</h3>
+                <p className="muted">
+                  {shortAddress(connectedWalletAddress)} · devnet
+                </p>
+                <div className="wallet-card">
+                  <strong>Mint authority</strong>
+                  <span>
+                    The connected wallet pays the devnet fees, signs the mint, and receives
+                    the asset.
+                  </span>
+                </div>
+                <button
+                  className="ghost-button"
+                  disabled={busyKey === "mint"}
+                  onClick={() => disconnect()}
+                  type="button"
+                >
+                  Disconnect Wallet
+                </button>
+              </>
+            ) : wallets.length > 0 ? (
+              <div className="stack">
+                <p className="muted">
+                  Connect a Solana wallet to pay for the mint and take ownership on devnet.
+                </p>
+                <div className="wallet-options">
+                  {wallets.map((availableWallet) => (
+                    <WalletConnectOption
+                      key={availableWallet.name}
+                      disabled={busyKey === "mint"}
+                      wallet={availableWallet}
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <p className="muted">
+                No Solana wallet was detected. Install a wallet that supports the Solana
+                Wallet Standard, then refresh.
+              </p>
+            )}
           </section>
 
           <section className="panel auth-panel">
@@ -656,6 +803,9 @@ export function App() {
                       <div className="collection-note">
                         <strong>{collection.themeNote}</strong>
                         <span>MPL Core collection key: {collection.collectionKey}</span>
+                        {collection.devnetCollection ? (
+                          <span>Devnet collection: {shortAddress(collection.devnetCollection.address)}</span>
+                        ) : null}
                       </div>
                     </div>
                   ) : (
@@ -710,13 +860,42 @@ export function App() {
                     <button className="ghost-button action-cta" onClick={() => void saveDraft()} disabled={busyKey === "save"}>
                       {busyKey === "save" ? "Saving..." : "Save Draft Link"}
                     </button>
-                    <button
-                      className="ghost-button action-cta"
-                      onClick={() => void createMint()}
-                      disabled={busyKey === "mint" || conflicts.length > 0}
-                    >
-                      {busyKey === "mint" ? "Minting..." : "Create Mint Intent"}
-                    </button>
+                    {account ? (
+                      <MintActionButton
+                        account={account}
+                        disabled={
+                          busyKey === "mint" ||
+                          conflicts.length > 0 ||
+                          !currentUser
+                        }
+                        isBusy={busyKey === "mint"}
+                        onMint={createMint}
+                      />
+                    ) : (
+                      <button className="ghost-button action-cta" disabled type="button">
+                        {currentUser ? "Connect Wallet To Mint" : "Sign In To Mint"}
+                      </button>
+                    )}
+                  </div>
+                  <div className="stack">
+                    <strong>Mint Wallet</strong>
+                    <div className="wallet-card">
+                      {account ? (
+                        <>
+                          <strong>{wallet?.name ?? "Connected Wallet"}</strong>
+                          <span>{connectedWalletAddress}</span>
+                        </>
+                      ) : (
+                        <>
+                          <strong>Wallet not connected</strong>
+                          <span>Connect a Solana wallet before submitting a devnet mint.</span>
+                        </>
+                      )}
+                    </div>
+                    <small className="muted">
+                      Wallet-signed mints use the connected wallet as payer, signer, and owner.
+                      {currentUser ? "" : " A TraitForge account is still required so mint history can be saved."}
+                    </small>
                   </div>
                   {sharedDraftId ? (
                     <p className="muted">Shareable route: /drafts/{sharedDraftId}</p>
@@ -741,7 +920,7 @@ export function App() {
                     </div>
                   ) : (
                     <p className="muted">
-                      Quote the build to simulate a devnet-ready MPL Core mint record.
+                      Quote the build to estimate the real devnet mint cost before submitting.
                     </p>
                   )}
                 </div>
@@ -785,14 +964,29 @@ export function App() {
                   </div>
                 </div>
                 <div>
-                  <h3>Mint intents</h3>
+                  <h3>Recent devnet mints</h3>
                   <div className="stack">
-                    {bootstrap?.mintIntents.map((intent) => (
-                      <div className="mint-item" key={intent.id}>
-                        <strong>{intent.simulatedAddress}</strong>
-                        <span>{intent.collectionSlug}</span>
+                    {bootstrap?.mints.map((mint) => (
+                      <div className="mint-item" key={mint.id}>
+                        <strong>{shortAddress(mint.assetAddress)}</strong>
+                        <span>
+                          {mint.collectionSlug} · owner {shortAddress(mint.recipientOwnerAddress)}
+                        </span>
                         <small>
-                          {intent.status} · {intent.quote.sol.toFixed(4)} SOL · {formatUtc(intent.createdAt)}
+                          {mint.status} · {mint.quote.sol.toFixed(4)} SOL · {formatUtc(mint.createdAt)}
+                        </small>
+                        <small>
+                          <a href={mint.explorerUrls.asset} target="_blank" rel="noreferrer">
+                            asset
+                          </a>{" "}
+                          ·{" "}
+                          <a href={mint.explorerUrls.transaction} target="_blank" rel="noreferrer">
+                            tx
+                          </a>{" "}
+                          ·{" "}
+                          <a href={mint.explorerUrls.collection} target="_blank" rel="noreferrer">
+                            collection
+                          </a>
                         </small>
                       </div>
                     ))}

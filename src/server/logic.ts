@@ -1,7 +1,7 @@
 import {
   buildMplCoreMetadata,
   createMintQuote
-} from "@obrera/mpl-core-kit-lib";
+} from "../shared/mpl.js";
 import type {
   AppState,
   CollectionSchema,
@@ -47,7 +47,7 @@ export function hydrateCollection(
   collection: CollectionSchema
 ): CollectionSchema {
   const mintedCount = state.assets.filter(
-    (asset) => asset.collectionSlug === collection.slug && asset.mintIntentId
+    (asset) => asset.collectionSlug === collection.slug && asset.mintId
   ).length;
 
   return {
@@ -124,7 +124,7 @@ export function computeUsageStats(
   collection: CollectionSchema
 ): TraitUsageStat[] {
   const mintedAssets = state.assets.filter(
-    (asset) => asset.collectionSlug === collection.slug && asset.mintIntentId
+    (asset) => asset.collectionSlug === collection.slug && asset.mintId
   );
   const usageMap = new Map<string, number>();
 
@@ -381,7 +381,7 @@ export function renderPreview(
     symbol: collection.symbol,
     description: `${collection.description} Rendered through TraitForge with server-authored trait layering.`,
     image: dataUri,
-    external_url: `https://traitforge070.colmena.dev/collections/${collection.slug}`,
+    external_url: "/",
     collection: {
       name: collection.name,
       family: "TraitForge",
@@ -532,7 +532,7 @@ export function buildAnalytics(
     }
   }
 
-  for (const mint of state.mintIntents.filter(
+  for (const mint of state.mints.filter(
     (entry) => entry.collectionSlug === collectionSlug
   )) {
     const asset = state.assets.find((entry) => entry.id === mint.assetId);

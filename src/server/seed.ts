@@ -1,11 +1,10 @@
-import { buildMplCoreMetadata, createSimulatedMintAddress } from "@obrera/mpl-core-kit-lib";
+import { buildMplCoreMetadata } from "../shared/mpl.js";
 import type {
   ActivityRecord,
   AppState,
   AssetRecord,
   CollectionSchema,
   DraftRecord,
-  MintIntentRecord,
   UserRecord
 } from "../shared/contracts.js";
 import { composeDraft, quoteDraft } from "./logic.js";
@@ -463,57 +462,18 @@ export function createSeedState(): AppState {
   const collection = buildCollection();
   const users = buildUsers();
   const baseState: AppState = {
-    version: 1,
+    version: 2,
     users,
     sessions: [],
     collections: [collection],
     drafts: [],
     assets: [],
-    mintIntents: [],
+    mints: [],
     activity: []
   };
 
-  const mintedSelections = {
-    backdrop: "monsoon-terminal",
-    core: "glass-vector",
-    aura: "monsoon-loop",
-    sigil: "archive-seal",
-    companion: "ember-finch"
-  };
-  const mintedQuote = quoteDraft(
-    baseState,
-    collection.slug,
-    mintedSelections,
-    "Harbor Relay // 001"
-  );
-  const mintedAsset: AssetRecord = {
-    id: "asset_harbor_relay_001",
-    ownerUserId: "user_obrera",
-    collectionSlug: collection.slug,
-    previewSvg: mintedQuote.preview.svg,
-    metadata: buildMplCoreMetadata(mintedQuote.preview.metadataInput),
-    createdAt: "2026-04-27T00:34:00Z"
-  };
-  const mintedIntent: MintIntentRecord = {
-    id: "mint_harbor_relay_001",
-    userId: "user_obrera",
-    collectionSlug: collection.slug,
-    assetId: mintedAsset.id,
-    quote: mintedQuote.quote,
-    simulatedAddress: createSimulatedMintAddress("harbor-relay-001"),
-    status: "minted",
-    createdAt: "2026-04-27T00:35:00Z"
-  };
-  mintedAsset.mintIntentId = mintedIntent.id;
-
-  const stateWithMint: AppState = {
-    ...baseState,
-    assets: [mintedAsset],
-    mintIntents: [mintedIntent]
-  };
-
   const obreraDraftComposition = quoteDraft(
-    stateWithMint,
+    baseState,
     collection.slug,
     {
       backdrop: "abyss-bloom",
@@ -526,7 +486,7 @@ export function createSeedState(): AppState {
   );
   const obreraPreviewAsset: AssetRecord = {
     id: "asset_draft_inspection_bloom",
-    ownerUserId: "user_obrera",
+    requesterUserId: "user_obrera",
     collectionSlug: collection.slug,
     previewSvg: obreraDraftComposition.preview.svg,
     metadata: buildMplCoreMetadata(obreraDraftComposition.preview.metadataInput),
@@ -549,7 +509,7 @@ export function createSeedState(): AppState {
   };
 
   const pilotDraftComposition = quoteDraft(
-    stateWithMint,
+    baseState,
     collection.slug,
     {
       backdrop: "sunline-vault",
@@ -562,7 +522,7 @@ export function createSeedState(): AppState {
   );
   const pilotPreviewAsset: AssetRecord = {
     id: "asset_draft_sunline_audit",
-    ownerUserId: "user_pilot",
+    requesterUserId: "user_pilot",
     collectionSlug: collection.slug,
     previewSvg: pilotDraftComposition.preview.svg,
     metadata: buildMplCoreMetadata(pilotDraftComposition.preview.metadataInput),
@@ -604,21 +564,12 @@ export function createSeedState(): AppState {
       "2026-04-27T00:29:00Z"
     ),
     activity(
-      "activity_3",
-      "user_obrera",
-      "Obrera",
-      "mint",
-      "Mint Simulator",
-      `Created simulated devnet-ready mint intent ${mintedIntent.simulatedAddress}.`,
-      "2026-04-27T00:35:00Z"
-    ),
-    activity(
       "activity_4",
       "user_obrera",
       "Obrera",
       "operator",
       "Metadata Diff",
-      "Reviewed Inspection Bloom against Harbor Relay // 001 to confirm sigil drift.",
+      "Reviewed Inspection Bloom against Sunline Audit to confirm sigil drift.",
       "2026-04-27T00:43:30Z"
     ),
     activity(
@@ -633,10 +584,10 @@ export function createSeedState(): AppState {
   ];
 
   return {
-    ...stateWithMint,
+    ...baseState,
     drafts: [obreraDraft, pilotDraft],
-    assets: [mintedAsset, obreraPreviewAsset, pilotPreviewAsset],
-    mintIntents: [mintedIntent],
+    assets: [obreraPreviewAsset, pilotPreviewAsset],
+    mints: [],
     activity: activityFeed
   };
 }

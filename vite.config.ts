@@ -11,7 +11,7 @@ export default defineConfig({
     alias: {
       "@obrera/mpl-core-kit-lib": path.resolve(
         rootDir,
-        "packages/mpl-core-kit-lib/dist/index.js"
+        "packages/mpl-core-kit-lib/dist/index.mjs"
       )
     }
   },

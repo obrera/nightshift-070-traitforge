@@ -357,6 +357,7 @@ button {
 .trait-option span,
 .trait-option small,
 .collection-note span,
+.wallet-card span,
 .schema-head span,
 .schema-row small,
 .diff-row span,
@@ -372,6 +373,32 @@ button {
 
 .action-panel {
   background: var(--panel-strong);
+}
+
+.wallet-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.wallet-option {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+}
+
+.wallet-card {
+  padding: 14px;
+  border-radius: 18px;
+  background: rgba(4, 11, 20, 0.72);
+  border: 1px solid rgba(120, 183, 220, 0.1);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wallet-card span {
+  overflow-wrap: anywhere;
 }
 
 .quote-box {
